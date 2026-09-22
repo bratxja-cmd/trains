@@ -48,7 +48,7 @@ WATCH = [
 ]
 
 # True — зберігати геть усі потяги з табло, ігноруючи WATCH.
-KEEP_ALL = False
+KEEP_ALL = True
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SNAPSHOTS_CSV = os.path.join(DATA_DIR, "snapshots.csv")
