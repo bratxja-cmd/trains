@@ -4,15 +4,16 @@
 Збір даних про затримки потягів з табло «Що з моїм поїздом?» АТ «Укрзалізниця».
 Джерело: https://uz-vezemo.uz.gov.ua/delayform
 
-Що робить один запуск:
-  1. Забирає сторінку одним HTTP-запитом (усі дані, включно з переліком станцій,
-     вже є в HTML — клік на сайті лише показує приховані рядки).
-  2. Фільтрує рейси за списком станцій WATCH — окремо позначає, чи станція є
-     кінцевою (endpoint), чи потяг просто проходить через неї (transit).
-  3. Дописує нові рядки в data/snapshots.csv і data/stops.csv ТІЛЬКИ якщо
-     щось змінилося з попереднього запуску (щоб не роздувати файли).
-  4. Перезаписує data/trips.csv — по одному рядку на рейс, з поточним станом.
-  5. Дописує рядок у data/run_log.csv — щоб було видно, чи запуск взагалі стався.
+Версія 2. Зміни проти першої:
+  * РЕЙСИ-ПРИМІРНИКИ (instance_id). Той самий номер потяга на тому самому
+    маршруті їздить щодня, а дата відправлення на сайті показується не
+    завжди. Тому новий примірник визначається не датою, а трьома ознаками:
+    рейс зник із табло надовго і повернувся / затримка різко впала /
+    перелік пройдених станцій «відкотився» на початок маршруту.
+    Завдяки цьому вчорашній рейс не перезаписується сьогоднішнім.
+  * Захист від формул у CSV (значення, що починаються з = + @, екрануються).
+  * max_delay_min коректно працює з від'ємними значеннями та порожнечею.
+  * n_updates перейменовано на n_seen — воно рахує саме появи в табло.
 """
 
 import csv
@@ -29,15 +30,17 @@ from bs4 import BeautifulSoup
 try:
     from zoneinfo import ZoneInfo
     KYIV = ZoneInfo("Europe/Kyiv")
-except Exception:              # на випадок відсутності tzdata
+    TZ_OK = True
+except Exception:              # немає tzdata — працюємо, але чесно це фіксуємо
     KYIV = timezone.utc
+    TZ_OK = False
 
 # ---------------------------------------------------------------- НАЛАШТУВАННЯ
 
 URL = "https://uz-vezemo.uz.gov.ua/delayform"
 
-# Ключові слова для пошуку станцій. Пишуться ВЕЛИКИМИ літерами, бо порівняння
-# йде з нормалізованою назвою. "КИЇВ" зловить і КИЇВ-ПАС., і КИЇВ-ДЕМІЇВСЬКИЙ.
+# Ключові слова для пошуку станцій. ВЕЛИКИМИ літерами.
+# "КИЇВ" зловить і КИЇВ-ПАС., і КИЇВ-ДЕМІЇВСЬКИЙ.
 WATCH = [
     "КИЇВ",
     "ХАРКІВ",
@@ -48,7 +51,14 @@ WATCH = [
 ]
 
 # True — зберігати геть усі потяги з табло, ігноруючи WATCH.
+# На час пілота рекомендовано True: даних небагато, зате фільтр можна буде
+# переграти заднім числом, нічого не втративши.
 KEEP_ALL = True
+
+# --- параметри визначення нового примірника рейсу
+GAP_HOURS = 4          # зник із табло довше, ніж на стільки годин -> новий рейс
+DELAY_DROP_MIN = 90    # затримка впала більше ніж на стільки хвилин -> новий рейс
+RETENTION_HOURS = 60   # скільки тримати в пам'яті рейси, яких зараз немає в табло
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SNAPSHOTS_CSV = os.path.join(DATA_DIR, "snapshots.csv")
@@ -59,8 +69,8 @@ STATE_JSON = os.path.join(DATA_DIR, "state.json")
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (compatible; uz-delay-research/1.0; "
-        "research project, contact via GitHub repo)"
+        "Mozilla/5.0 (compatible; uz-delay-research/2.0; "
+        "non-commercial research project)"
     ),
     "Accept-Language": "uk-UA,uk;q=0.9",
 }
@@ -71,7 +81,7 @@ DASHES = {"", "—", "–", "-", "−"}
 
 
 def norm(text):
-    """Нормалізує назву станції: прибирає нерозривні пробіли, стрілки, регістр."""
+    """Нормалізує назву станції: нерозривні пробіли, стрілки, верхній регістр."""
     if text is None:
         return ""
     text = text.replace("\xa0", " ").replace("\u2192", " ").replace("→", " ")
@@ -104,6 +114,13 @@ def clean(text):
     return "" if text in DASHES else text
 
 
+def csv_safe(value):
+    """Захист від формул: Excel виконує значення, що починається з = + @ тощо."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def digest(obj):
     return hashlib.sha1(
         json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -112,6 +129,13 @@ def digest(obj):
 
 def matches_watch(station_norm):
     return any(key in station_norm for key in WATCH)
+
+
+def as_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # -------------------------------------------------------------------- ПАРСИНГ
@@ -126,28 +150,17 @@ def parse_stops(main_row):
         station_el = node.select_one(".delay-detail__station")
         if station_el is not None:
             classes = node.get("class") or []
-            stops.append(
-                {
-                    "seq": seq,
-                    "station": clean(station_el.get_text()),
-                    "dev_min": parse_hm(
-                        node.select_one(".delay-detail__dev").get_text()
-                        if node.select_one(".delay-detail__dev")
-                        else None
-                    ),
-                    "forecast": clean(
-                        node.select_one(".delay-detail__fc").get_text()
-                        if node.select_one(".delay-detail__fc")
-                        else None
-                    ),
-                    "scheduled": clean(
-                        node.select_one(".delay-detail__sched").get_text()
-                        if node.select_one(".delay-detail__sched")
-                        else None
-                    ),
-                    "passed": "delay-row__detail--passed" in classes,
-                }
-            )
+            dev_el = node.select_one(".delay-detail__dev")
+            fc_el = node.select_one(".delay-detail__fc")
+            sched_el = node.select_one(".delay-detail__sched")
+            stops.append({
+                "seq": seq,
+                "station": clean(station_el.get_text()),
+                "dev_min": parse_hm(dev_el.get_text() if dev_el else None),
+                "forecast": clean(fc_el.get_text() if fc_el else None),
+                "scheduled": clean(sched_el.get_text() if sched_el else None),
+                "passed": "delay-row__detail--passed" in classes,
+            })
             seq += 1
         node = node.find_next_sibling("tr")
     return stops
@@ -178,8 +191,8 @@ def parse_row(tr):
     station_to = clean(to_el.get_text()) if to_el else ""
 
     stops = parse_stops(tr)
+    passed_count = sum(1 for s in stops if s["passed"])
 
-    # Тип збігу: кінцева станція / проміжна / обидва
     endpoint_hit = matches_watch(norm(station_from)) or matches_watch(norm(station_to))
     transit_hit = any(matches_watch(norm(s["station"])) for s in stops)
     if endpoint_hit and transit_hit:
@@ -191,10 +204,11 @@ def parse_row(tr):
     else:
         match_type = ""
 
+    train_number = clean(num_el.get_text())
     dep_date = clean(date_el.get_text()) if date_el else ""
 
     return {
-        "train_number": clean(num_el.get_text()),
+        "train_number": train_number,
         "departure_date": dep_date,
         "station_from": station_from,
         "station_to": station_to,
@@ -206,11 +220,10 @@ def parse_row(tr):
         "reason": clean(tds[7].get_text()),
         "has_route": "delay-row--has-route" in (tr.get("class") or []),
         "n_stops": len(stops),
+        "passed_count": passed_count,
         "match_type": match_type,
         "stops": stops,
-        "trip_key": "|".join(
-            [clean(num_el.get_text()), station_from, station_to, dep_date]
-        ),
+        "trip_key": "|".join([train_number, station_from, station_to, dep_date]),
     }
 
 
@@ -226,30 +239,60 @@ def parse_page(html):
     return page_updated, rows
 
 
+# ------------------------------------------------- ВИЗНАЧЕННЯ ПРИМІРНИКА РЕЙСУ
+
+
+def is_new_instance(prev, row, now_epoch):
+    """Чи це новий рейс, а не продовження вже відомого? -> (bool, причина)."""
+    if prev is None:
+        return True, "first_seen"
+
+    gap_h = (now_epoch - float(prev.get("last_seen_epoch") or 0)) / 3600.0
+    if gap_h >= GAP_HOURS:
+        return True, f"gap_{gap_h:.1f}h"
+
+    prev_delay = prev.get("delay_min")
+    cur_delay = row["delay_min"]
+    if prev_delay is not None and cur_delay is not None:
+        if prev_delay - cur_delay >= DELAY_DROP_MIN:
+            return True, f"delay_drop_{prev_delay - cur_delay}"
+
+    # маршрут «відкотився» на початок: пройдених станцій стало менше
+    if row["n_stops"] and row["passed_count"] < (as_int(prev.get("passed_count"), 0) or 0):
+        return True, "route_reset"
+
+    return False, ""
+
+
+def make_instance_id(trip_key, now):
+    return f"{trip_key}@{now.strftime('%Y%m%d-%H%M')}"
+
+
 # ---------------------------------------------------------------------- ЗАПИС
 
 SNAP_FIELDS = [
-    "snapshot_ts_kyiv", "trip_key", "train_number", "departure_date",
-    "station_from", "station_to", "delay_min", "forecast_arrival",
-    "planned_arrival", "status", "reliability", "reason",
-    "match_type", "has_route", "n_stops", "page_updated",
+    "snapshot_ts_kyiv", "instance_id", "trip_key", "train_number",
+    "departure_date", "station_from", "station_to", "delay_min",
+    "forecast_arrival", "planned_arrival", "status", "reliability", "reason",
+    "match_type", "has_route", "n_stops", "passed_count", "page_updated",
 ]
 
 STOP_FIELDS = [
-    "snapshot_ts_kyiv", "trip_key", "seq", "station",
+    "snapshot_ts_kyiv", "instance_id", "trip_key", "seq", "station",
     "dev_min", "forecast", "scheduled", "passed", "is_watched",
 ]
 
 TRIP_FIELDS = [
-    "trip_key", "train_number", "departure_date", "station_from", "station_to",
-    "match_type", "first_seen_kyiv", "last_seen_kyiv", "n_updates",
-    "last_delay_min", "max_delay_min", "last_status", "last_reliability",
-    "last_reason", "n_stops",
+    "instance_id", "trip_key", "train_number", "departure_date",
+    "station_from", "station_to", "match_type", "first_seen_kyiv",
+    "last_seen_kyiv", "n_seen", "last_delay_min", "max_delay_min",
+    "min_delay_min", "last_status", "last_reliability", "last_reason",
+    "n_stops", "instance_reason",
 ]
 
 RUN_FIELDS = [
-    "run_ts_kyiv", "run_ts_utc", "ok", "error", "page_updated",
-    "rows_total", "rows_kept", "snapshots_added", "stops_added",
+    "run_ts_kyiv", "run_ts_utc", "ok", "error", "tz_ok", "page_updated",
+    "rows_total", "rows_kept", "new_instances", "snapshots_added", "stops_added",
 ]
 
 
@@ -262,7 +305,7 @@ def append_rows(path, fields, rows):
         if new_file:
             w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: csv_safe(v) for k, v in r.items()})
     return len(rows)
 
 
@@ -272,7 +315,8 @@ def read_trips():
     out = {}
     with open(TRIPS_CSV, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
-            out[row["trip_key"]] = row
+            if row.get("instance_id"):
+                out[row["instance_id"]] = row
     return out
 
 
@@ -280,18 +324,20 @@ def write_trips(trips):
     with open(TRIPS_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=TRIP_FIELDS, extrasaction="ignore")
         w.writeheader()
-        for key in sorted(trips):
-            w.writerow(trips[key])
+        for key in sorted(trips, key=lambda k: trips[k].get("first_seen_kyiv") or ""):
+            w.writerow({k: csv_safe(v) for k, v in trips[key].items()})
 
 
 def load_state():
     if os.path.exists(STATE_JSON):
         try:
             with open(STATE_JSON, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict) and "trips" in data:
+                return data
         except Exception:
-            return {}
-    return {}
+            pass
+    return {"trips": {}}
 
 
 def save_state(state):
@@ -305,13 +351,14 @@ def save_state(state):
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     now = datetime.now(KYIV)
+    now_epoch = now.timestamp()
     ts = now.strftime("%Y-%m-%d %H:%M:%S")
     ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     run = {
         "run_ts_kyiv": ts, "run_ts_utc": ts_utc, "ok": 0, "error": "",
-        "page_updated": "", "rows_total": 0, "rows_kept": 0,
-        "snapshots_added": 0, "stops_added": 0,
+        "tz_ok": int(TZ_OK), "page_updated": "", "rows_total": 0, "rows_kept": 0,
+        "new_instances": 0, "snapshots_added": 0, "stops_added": 0,
     }
 
     try:
@@ -332,33 +379,54 @@ def main():
     kept = [r for r in rows if KEEP_ALL or r["match_type"]]
     run["rows_kept"] = len(kept)
 
-    old_state = load_state()
-    new_state = {}
+    state = load_state()
     trips = read_trips()
     snap_rows, stop_rows = [], []
+    seen_now = set()
 
     for r in kept:
         key = r["trip_key"]
 
-        main_fingerprint = digest(
-            [r["delay_min"], r["forecast_arrival"], r["planned_arrival"],
-             r["status"], r["reliability"], r["reason"]]
-        )
-        stops_fingerprint = digest(r["stops"])
-        new_state[key] = {"main": main_fingerprint, "stops": stops_fingerprint}
-        prev = old_state.get(key, {})
+        # Колізія в межах одного зрізу (той самий рейс двічі на сторінці):
+        # другий екземпляр отримує власний ключ, щоб не затерти перший.
+        while key in seen_now:
+            key += "#"
+        r["trip_key"] = key
+        seen_now.add(key)
 
-        if prev.get("main") != main_fingerprint:
+        prev = state["trips"].get(key)
+        new_inst, reason = is_new_instance(prev, r, now_epoch)
+
+        if new_inst:
+            instance_id = make_instance_id(key, now)
+            # страховка: якщо такий id вже існує (два примірники в межах
+            # однієї хвилини), робимо його унікальним
+            while instance_id in trips:
+                instance_id += "b"
+            run["new_instances"] += 1
+        else:
+            instance_id = prev.get("instance_id") or make_instance_id(key, now)
+
+        main_fingerprint = digest([
+            r["delay_min"], r["forecast_arrival"], r["planned_arrival"],
+            r["status"], r["reliability"], r["reason"],
+        ])
+        stops_fingerprint = digest(r["stops"])
+
+        # знімок пишемо, якщо це новий рейс АБО щось змінилось
+        if new_inst or (prev or {}).get("main") != main_fingerprint:
             snap = {k: r.get(k) for k in SNAP_FIELDS}
             snap["snapshot_ts_kyiv"] = ts
+            snap["instance_id"] = instance_id
             snap["page_updated"] = page_updated
             snap["has_route"] = int(r["has_route"])
             snap_rows.append(snap)
 
-        if r["stops"] and prev.get("stops") != stops_fingerprint:
+        if r["stops"] and (new_inst or (prev or {}).get("stops") != stops_fingerprint):
             for s in r["stops"]:
                 stop_rows.append({
                     "snapshot_ts_kyiv": ts,
+                    "instance_id": instance_id,
                     "trip_key": key,
                     "seq": s["seq"],
                     "station": s["station"],
@@ -369,11 +437,12 @@ def main():
                     "is_watched": int(matches_watch(norm(s["station"]))),
                 })
 
-        # ---- зведена таблиця рейсів (перезапис одного рядка на рейс)
-        prev_trip = trips.get(key)
+        # ---- зведена таблиця: рядок на ПРИМІРНИК рейсу
         delay = r["delay_min"]
-        if prev_trip is None:
-            trips[key] = {
+        trip = trips.get(instance_id)
+        if trip is None:
+            trips[instance_id] = {
+                "instance_id": instance_id,
                 "trip_key": key,
                 "train_number": r["train_number"],
                 "departure_date": r["departure_date"],
@@ -382,24 +451,29 @@ def main():
                 "match_type": r["match_type"],
                 "first_seen_kyiv": ts,
                 "last_seen_kyiv": ts,
-                "n_updates": 1,
+                "n_seen": 1,
                 "last_delay_min": delay,
                 "max_delay_min": delay,
+                "min_delay_min": delay,
                 "last_status": r["status"],
                 "last_reliability": r["reliability"],
                 "last_reason": r["reason"],
                 "n_stops": r["n_stops"],
+                "instance_reason": reason,
             }
         else:
-            try:
-                prev_max = int(prev_trip.get("max_delay_min") or 0)
-            except ValueError:
-                prev_max = 0
-            prev_trip.update({
+            prev_max = as_int(trip.get("max_delay_min"))
+            prev_min = as_int(trip.get("min_delay_min"))
+            new_max = prev_max if delay is None else (
+                delay if prev_max is None else max(prev_max, delay))
+            new_min = prev_min if delay is None else (
+                delay if prev_min is None else min(prev_min, delay))
+            trip.update({
                 "last_seen_kyiv": ts,
-                "n_updates": int(prev_trip.get("n_updates") or 0) + 1,
+                "n_seen": (as_int(trip.get("n_seen"), 0) or 0) + 1,
                 "last_delay_min": delay,
-                "max_delay_min": max(prev_max, delay if delay is not None else prev_max),
+                "max_delay_min": new_max,
+                "min_delay_min": new_min,
                 "last_status": r["status"],
                 "last_reliability": r["reliability"],
                 "last_reason": r["reason"],
@@ -407,16 +481,36 @@ def main():
                 "match_type": r["match_type"],
             })
 
+        state["trips"][key] = {
+            "instance_id": instance_id,
+            "last_seen_epoch": now_epoch,
+            "main": main_fingerprint,
+            "stops": stops_fingerprint,
+            "delay_min": delay,
+            "passed_count": r["passed_count"],
+        }
+
+    # прибираємо з пам'яті рейси, яких давно немає в табло
+    cutoff = now_epoch - RETENTION_HOURS * 3600
+    state["trips"] = {
+        k: v for k, v in state["trips"].items()
+        if float(v.get("last_seen_epoch") or 0) >= cutoff
+    }
+
     run["snapshots_added"] = append_rows(SNAPSHOTS_CSV, SNAP_FIELDS, snap_rows)
     run["stops_added"] = append_rows(STOPS_CSV, STOP_FIELDS, stop_rows)
     write_trips(trips)
-    save_state(new_state)
+    save_state(state)
     append_rows(RUN_LOG_CSV, RUN_FIELDS, [run])
 
     print(
         f"{ts} | на сторінці: {run['rows_total']} | відібрано: {run['rows_kept']} "
-        f"| нових знімків: {run['snapshots_added']} | рядків станцій: {run['stops_added']}"
+        f"| нових рейсів: {run['new_instances']} "
+        f"| знімків: {run['snapshots_added']} | рядків станцій: {run['stops_added']}"
     )
+    if not TZ_OK:
+        print("УВАГА: не вдалося завантажити Europe/Kyiv, час пишеться в UTC",
+              file=sys.stderr)
     return 0
 
 
