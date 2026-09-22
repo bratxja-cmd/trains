@@ -2,14 +2,16 @@ name: scrape-uz-delays
 
 on:
   schedule:
-    # Кожні 20 хв, АЛЕ зі зміщенням від початку години (13/33/53 хвилина).
-    # На "0" та "30" хвилині навантаження на GitHub найбільше і запуск
-    # найчастіше затримується або взагалі пропускається.
-    - cron: "13,33,53 * * * *"
-  workflow_dispatch:      # дозволяє запустити вручну кнопкою в інтерфейсі
+    # Кожні 30 хв, зі зміщенням від початку години (7-а та 37-а хвилина).
+    # На "0" та "30" навантаження на GitHub найбільше і запуск найчастіше
+    # затримується або пропускається.
+    # 48 запусків на добу ≈ 1440 хв/міс — влазить у безкоштовну квоту
+    # приватного репозиторію (2000 хв). Частіше робити не варто.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:      # кнопка ручного запуску в інтерфейсі
 
 permissions:
-  contents: write         # без цього крок git push впаде з 403
+  contents: write         # без цього git push впаде з помилкою 403
 
 concurrency:
   group: scrape-uz
@@ -23,6 +25,8 @@ jobs:
     steps:
       - name: Забрати репозиторій
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # повна історія: без цього git pull --rebase ламається
 
       - name: Поставити Python
         uses: actions/setup-python@v5
@@ -30,7 +34,7 @@ jobs:
           python-version: "3.11"
 
       - name: Встановити залежності
-        run: pip install --quiet requests beautifulsoup4
+        run: pip install --quiet requests beautifulsoup4 tzdata
 
       - name: Зібрати дані
         run: python scraper.py
@@ -39,12 +43,13 @@ jobs:
         run: |
           git config user.name "uz-delay-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Спершу підтягуємо чужі зміни, потім комітимо свої.
+          # Так дані запуску не втрачаються через конфлікт при push.
+          git pull --rebase --autostash
           git add data/
           if git diff --staged --quiet; then
             echo "Змін немає, коміт не потрібен"
             exit 0
           fi
           git commit -m "data: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          # На випадок, якщо попередній запуск щойно запушив свій коміт
-          git pull --rebase --autostash origin ${{ github.ref_name }} || true
           git push
