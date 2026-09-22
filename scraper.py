@@ -4,7 +4,7 @@
 Збір даних про затримки потягів з табло «Що з моїм поїздом?» АТ «Укрзалізниця».
 Джерело: https://uz-vezemo.uz.gov.ua/delayform
 
-Версія 2. Зміни проти першої:
+Версія 3. Зміни проти першої:
   * РЕЙСИ-ПРИМІРНИКИ (instance_id). Той самий номер потяга на тому самому
     маршруті їздить щодня, а дата відправлення на сайті показується не
     завжди. Тому новий примірник визначається не датою, а трьома ознаками:
@@ -14,6 +14,11 @@
   * Захист від формул у CSV (значення, що починаються з = + @, екрануються).
   * max_delay_min коректно працює з від'ємними значеннями та порожнечею.
   * n_updates перейменовано на n_seen — воно рахує саме появи в табло.
+  * Атомарний запис: файли, що перезаписуються цілком, спершу пишуться в
+    тимчасовий файл і лише потім підміняють старий. Обірваний запуск не
+    може залишити після себе обрізаний CSV.
+  * Дублікати рейсів на одній сторінці розрізняються за стабільною ознакою
+    (перша станція / планове прибуття), а не за порядком рядків.
 """
 
 import csv
@@ -21,7 +26,9 @@ import json
 import os
 import sys
 import hashlib
+import tempfile
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 
 import requests
@@ -63,6 +70,7 @@ RETENTION_HOURS = 60   # скільки тримати в пам'яті рейс
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SNAPSHOTS_CSV = os.path.join(DATA_DIR, "snapshots.csv")
 STOPS_CSV = os.path.join(DATA_DIR, "stops.csv")
+STOPS_LATEST_CSV = os.path.join(DATA_DIR, "stops_latest.csv")
 TRIPS_CSV = os.path.join(DATA_DIR, "trips.csv")
 RUN_LOG_CSV = os.path.join(DATA_DIR, "run_log.csv")
 STATE_JSON = os.path.join(DATA_DIR, "state.json")
@@ -287,13 +295,41 @@ TRIP_FIELDS = [
     "station_from", "station_to", "match_type", "first_seen_kyiv",
     "last_seen_kyiv", "n_seen", "last_delay_min", "max_delay_min",
     "min_delay_min", "last_status", "last_reliability", "last_reason",
-    "n_stops", "instance_reason",
+    "n_stops", "passed_count", "last_stop_passed", "finished",
+    "finished_at_kyiv", "final_delay_min", "instance_reason",
+]
+
+LATEST_STOP_FIELDS = [
+    "instance_id", "trip_key", "train_number", "station_from", "station_to",
+    "seq", "station", "dev_min", "forecast", "scheduled", "passed",
+    "is_watched", "updated_ts_kyiv",
 ]
 
 RUN_FIELDS = [
     "run_ts_kyiv", "run_ts_utc", "ok", "error", "tz_ok", "page_updated",
     "rows_total", "rows_kept", "new_instances", "snapshots_added", "stops_added",
+    "finished_now",
 ]
+
+
+def atomic_write(path, write_fn, encoding="utf-8-sig", newline=""):
+    """
+    Пише через тимчасовий файл і атомарну підміну.
+    Якщо процес обірветься посеред запису, старий файл лишиться цілим.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".part")
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", newline=newline, encoding=encoding) as f:
+            write_fn(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def append_rows(path, fields, rows):
@@ -321,11 +357,35 @@ def read_trips():
 
 
 def write_trips(trips):
-    with open(TRIPS_CSV, "w", newline="", encoding="utf-8-sig") as f:
+    def _write(f):
         w = csv.DictWriter(f, fieldnames=TRIP_FIELDS, extrasaction="ignore")
         w.writeheader()
         for key in sorted(trips, key=lambda k: trips[k].get("first_seen_kyiv") or ""):
             w.writerow({k: csv_safe(v) for k, v in trips[key].items()})
+
+    atomic_write(TRIPS_CSV, _write)
+
+
+def read_stops_latest():
+    """Зведена таблиця станцій: ключ (instance_id, seq) -> рядок."""
+    if not os.path.exists(STOPS_LATEST_CSV):
+        return {}
+    out = {}
+    with open(STOPS_LATEST_CSV, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if row.get("instance_id"):
+                out[(row["instance_id"], row.get("seq", ""))] = row
+    return out
+
+
+def write_stops_latest(rows):
+    def _write(f):
+        w = csv.DictWriter(f, fieldnames=LATEST_STOP_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for key in sorted(rows, key=lambda k: (k[0], as_int(k[1], 0) or 0)):
+            w.writerow({k: csv_safe(v) for k, v in rows[key].items()})
+
+    atomic_write(STOPS_LATEST_CSV, _write)
 
 
 def load_state():
@@ -341,8 +401,10 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_JSON, "w", encoding="utf-8") as f:
+    def _write(f):
         json.dump(state, f, ensure_ascii=False, indent=0, sort_keys=True)
+
+    atomic_write(STATE_JSON, _write, encoding="utf-8", newline=None)
 
 
 # ----------------------------------------------------------------------- MAIN
@@ -359,6 +421,7 @@ def main():
         "run_ts_kyiv": ts, "run_ts_utc": ts_utc, "ok": 0, "error": "",
         "tz_ok": int(TZ_OK), "page_updated": "", "rows_total": 0, "rows_kept": 0,
         "new_instances": 0, "snapshots_added": 0, "stops_added": 0,
+        "finished_now": 0,
     }
 
     try:
@@ -379,16 +442,31 @@ def main():
     kept = [r for r in rows if KEEP_ALL or r["match_type"]]
     run["rows_kept"] = len(kept)
 
+    # Дублікати в межах одного зрізу (той самий номер і маршрут двічі)
+    # розрізняємо за стабільною ознакою, а не за порядком рядків на сторінці:
+    # порядок може змінитись між запусками і переплутати два різні рейси.
+    base_counts = Counter(r["trip_key"] for r in kept)
+
     state = load_state()
     trips = read_trips()
+    stops_latest = read_stops_latest()
     snap_rows, stop_rows = [], []
     seen_now = set()
+    seen_instances = set()
 
     for r in kept:
         key = r["trip_key"]
 
-        # Колізія в межах одного зрізу (той самий рейс двічі на сторінці):
-        # другий екземпляр отримує власний ключ, щоб не затерти перший.
+        if base_counts[key] > 1:
+            tag = (
+                (r["stops"][0]["station"] if r["stops"] else "")
+                or r["planned_arrival"]
+                or r["forecast_arrival"]
+                or ""
+            )
+            key = f"{key}#{tag}"
+
+        # якщо навіть так ключі збіглись — розводимо їх примусово
         while key in seen_now:
             key += "#"
         r["trip_key"] = key
@@ -406,6 +484,8 @@ def main():
             run["new_instances"] += 1
         else:
             instance_id = prev.get("instance_id") or make_instance_id(key, now)
+
+        seen_instances.add(instance_id)
 
         main_fingerprint = digest([
             r["delay_min"], r["forecast_arrival"], r["planned_arrival"],
@@ -437,6 +517,25 @@ def main():
                     "is_watched": int(matches_watch(norm(s["station"]))),
                 })
 
+        # ---- зведена таблиця станцій: по одному рядку на станцію рейсу,
+        #      перезаписується актуальними значеннями
+        for st in r["stops"]:
+            stops_latest[(instance_id, str(st["seq"]))] = {
+                "instance_id": instance_id,
+                "trip_key": key,
+                "train_number": r["train_number"],
+                "station_from": r["station_from"],
+                "station_to": r["station_to"],
+                "seq": st["seq"],
+                "station": st["station"],
+                "dev_min": st["dev_min"],
+                "forecast": st["forecast"],
+                "scheduled": st["scheduled"],
+                "passed": int(st["passed"]),
+                "is_watched": int(matches_watch(norm(st["station"]))),
+                "updated_ts_kyiv": ts,
+            }
+
         # ---- зведена таблиця: рядок на ПРИМІРНИК рейсу
         delay = r["delay_min"]
         trip = trips.get(instance_id)
@@ -459,6 +558,11 @@ def main():
                 "last_reliability": r["reliability"],
                 "last_reason": r["reason"],
                 "n_stops": r["n_stops"],
+                "passed_count": r["passed_count"],
+                "last_stop_passed": 1 if (r["n_stops"] and r["passed_count"] >= r["n_stops"]) else 0,
+                "finished": 0,
+                "finished_at_kyiv": "",
+                "final_delay_min": "",
                 "instance_reason": reason,
             }
         else:
@@ -479,6 +583,12 @@ def main():
                 "last_reason": r["reason"],
                 "n_stops": r["n_stops"],
                 "match_type": r["match_type"],
+                "passed_count": r["passed_count"],
+                "last_stop_passed": 1 if (r["n_stops"] and r["passed_count"] >= r["n_stops"]) else 0,
+                # рейс знову в табло -> він не завершений
+                "finished": 0,
+                "finished_at_kyiv": "",
+                "final_delay_min": "",
             })
 
         state["trips"][key] = {
@@ -497,16 +607,29 @@ def main():
         if float(v.get("last_seen_epoch") or 0) >= cutoff
     }
 
+    # ---- рейси, яких більше немає в табло, позначаємо завершеними
+    for inst_id, trip in trips.items():
+        if inst_id in seen_instances:
+            continue
+        if as_int(trip.get("finished"), 0):
+            continue
+        trip["finished"] = 1
+        trip["finished_at_kyiv"] = ts
+        trip["final_delay_min"] = trip.get("last_delay_min", "")
+        run["finished_now"] += 1
+
     run["snapshots_added"] = append_rows(SNAPSHOTS_CSV, SNAP_FIELDS, snap_rows)
     run["stops_added"] = append_rows(STOPS_CSV, STOP_FIELDS, stop_rows)
     write_trips(trips)
+    write_stops_latest(stops_latest)
     save_state(state)
     append_rows(RUN_LOG_CSV, RUN_FIELDS, [run])
 
     print(
         f"{ts} | на сторінці: {run['rows_total']} | відібрано: {run['rows_kept']} "
         f"| нових рейсів: {run['new_instances']} "
-        f"| знімків: {run['snapshots_added']} | рядків станцій: {run['stops_added']}"
+        f"| знімків: {run['snapshots_added']} | рядків станцій: {run['stops_added']} "
+        f"| завершено: {run['finished_now']}"
     )
     if not TZ_OK:
         print("УВАГА: не вдалося завантажити Europe/Kyiv, час пишеться в UTC",
