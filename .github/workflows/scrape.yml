@@ -1,0 +1,50 @@
+name: scrape-uz-delays
+
+on:
+  schedule:
+    # Кожні 20 хв, АЛЕ зі зміщенням від початку години (13/33/53 хвилина).
+    # На "0" та "30" хвилині навантаження на GitHub найбільше і запуск
+    # найчастіше затримується або взагалі пропускається.
+    - cron: "13,33,53 * * * *"
+  workflow_dispatch:      # дозволяє запустити вручну кнопкою в інтерфейсі
+
+permissions:
+  contents: write         # без цього крок git push впаде з 403
+
+concurrency:
+  group: scrape-uz
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Забрати репозиторій
+        uses: actions/checkout@v4
+
+      - name: Поставити Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Встановити залежності
+        run: pip install --quiet requests beautifulsoup4
+
+      - name: Зібрати дані
+        run: python scraper.py
+
+      - name: Закомітити зміни
+        run: |
+          git config user.name "uz-delay-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --staged --quiet; then
+            echo "Змін немає, коміт не потрібен"
+            exit 0
+          fi
+          git commit -m "data: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          # На випадок, якщо попередній запуск щойно запушив свій коміт
+          git pull --rebase --autostash origin ${{ github.ref_name }} || true
+          git push
