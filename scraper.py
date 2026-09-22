@@ -4,7 +4,7 @@
 Збір даних про затримки потягів з табло «Що з моїм поїздом?» АТ «Укрзалізниця».
 Джерело: https://uz-vezemo.uz.gov.ua/delayform
 
-Версія 3. Зміни проти першої:
+Версія 4. Зміни проти першої:
   * РЕЙСИ-ПРИМІРНИКИ (instance_id). Той самий номер потяга на тому самому
     маршруті їздить щодня, а дата відправлення на сайті показується не
     завжди. Тому новий примірник визначається не датою, а трьома ознаками:
@@ -19,6 +19,14 @@
     може залишити після себе обрізаний CSV.
   * Дублікати рейсів на одній сторінці розрізняються за стабільною ознакою
     (перша станція / планове прибуття), а не за порядком рядків.
+  * Ознака route_reset спрацьовує лише за незмінної довжини маршруту і при
+    відкаті щонайменше на ROUTE_RESET_MIN станцій: УЗ додає та прибирає
+    станції в переліку, і без цієї умови рейс помилково дробився надвоє.
+  * stops_latest більше не затирає відоме значення порожнім. УЗ прибирає
+    фактичні дані по станції після її проходження; тепер останнє відоме
+    значення зберігається, а колонка kept_last_known це позначає.
+  * У stops.csv пишуться лише станції, які справді змінились, а не весь
+    маршрут щоразу. Обсяг файлу падає приблизно на порядок.
 """
 
 import csv
@@ -65,6 +73,7 @@ KEEP_ALL = True
 # --- параметри визначення нового примірника рейсу
 GAP_HOURS = 4          # зник із табло довше, ніж на стільки годин -> новий рейс
 DELAY_DROP_MIN = 90    # затримка впала більше ніж на стільки хвилин -> новий рейс
+ROUTE_RESET_MIN = 3    # на стільки станцій має «відкотитись» маршрут -> новий рейс
 RETENTION_HOURS = 60   # скільки тримати в пам'яті рейси, яких зараз немає в табло
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -265,11 +274,60 @@ def is_new_instance(prev, row, now_epoch):
         if prev_delay - cur_delay >= DELAY_DROP_MIN:
             return True, f"delay_drop_{prev_delay - cur_delay}"
 
-    # маршрут «відкотився» на початок: пройдених станцій стало менше
-    if row["n_stops"] and row["passed_count"] < (as_int(prev.get("passed_count"), 0) or 0):
-        return True, "route_reset"
+    # Маршрут «відкотився» на початок.
+    # Порівнюємо ТІЛЬКИ якщо довжина маршруту не змінилась: УЗ час від часу
+    # додає або прибирає станції в переліку, і тоді кількості непорівнянні.
+    prev_stops = as_int(prev.get("n_stops"))
+    prev_passed = as_int(prev.get("passed_count"))
+    if (
+        row["n_stops"]
+        and prev_stops is not None
+        and prev_passed is not None
+        and row["n_stops"] == prev_stops
+        and (prev_passed - row["passed_count"]) >= ROUTE_RESET_MIN
+    ):
+        return True, f"route_reset_{prev_passed}->{row['passed_count']}"
 
     return False, ""
+
+
+def is_blank(value):
+    return value is None or value == ""
+
+
+def merge_stop(old_row, stop, instance_id, trip_key, row, ts):
+    """
+    Зведений рядок станції. УЗ прибирає фактичні дані після проходження
+    станції, тому порожнє нове значення НЕ затирає вже відоме старе.
+    """
+    old_row = old_row or {}
+    kept = 0
+    merged = {}
+    for field, value in (
+        ("dev_min", stop["dev_min"]),
+        ("forecast", stop["forecast"]),
+        ("scheduled", stop["scheduled"]),
+    ):
+        if is_blank(value) and not is_blank(old_row.get(field)):
+            merged[field] = old_row[field]
+            kept = 1
+        else:
+            merged[field] = value
+
+    merged.update({
+        "instance_id": instance_id,
+        "trip_key": trip_key,
+        "train_number": row["train_number"],
+        "station_from": row["station_from"],
+        "station_to": row["station_to"],
+        "seq": stop["seq"],
+        "station": stop["station"],
+        "passed": int(stop["passed"]),          # прапорець завжди актуальний
+        "is_watched": int(matches_watch(norm(stop["station"]))),
+        "kept_last_known": kept,
+        "updated_ts_kyiv": ts,
+    })
+    return merged
 
 
 def make_instance_id(trip_key, now):
@@ -302,13 +360,13 @@ TRIP_FIELDS = [
 LATEST_STOP_FIELDS = [
     "instance_id", "trip_key", "train_number", "station_from", "station_to",
     "seq", "station", "dev_min", "forecast", "scheduled", "passed",
-    "is_watched", "updated_ts_kyiv",
+    "is_watched", "kept_last_known", "updated_ts_kyiv",
 ]
 
 RUN_FIELDS = [
     "run_ts_kyiv", "run_ts_utc", "ok", "error", "tz_ok", "page_updated",
     "rows_total", "rows_kept", "new_instances", "snapshots_added", "stops_added",
-    "finished_now",
+    "stops_latest_rows", "finished_now",
 ]
 
 
@@ -421,7 +479,7 @@ def main():
         "run_ts_kyiv": ts, "run_ts_utc": ts_utc, "ok": 0, "error": "",
         "tz_ok": int(TZ_OK), "page_updated": "", "rows_total": 0, "rows_kept": 0,
         "new_instances": 0, "snapshots_added": 0, "stops_added": 0,
-        "finished_now": 0,
+        "stops_latest_rows": 0, "finished_now": 0,
     }
 
     try:
@@ -491,7 +549,6 @@ def main():
             r["delay_min"], r["forecast_arrival"], r["planned_arrival"],
             r["status"], r["reliability"], r["reason"],
         ])
-        stops_fingerprint = digest(r["stops"])
 
         # знімок пишемо, якщо це новий рейс АБО щось змінилось
         if new_inst or (prev or {}).get("main") != main_fingerprint:
@@ -502,39 +559,34 @@ def main():
             snap["has_route"] = int(r["has_route"])
             snap_rows.append(snap)
 
-        if r["stops"] and (new_inst or (prev or {}).get("stops") != stops_fingerprint):
-            for s in r["stops"]:
+        # ---- станції: в сирий архів пишемо ЛИШЕ ті, що справді змінились,
+        #      а не весь маршрут щоразу
+        prev_stop_hashes = (prev or {}).get("stop_hashes") or {}
+        stop_hashes = {}
+        for st in r["stops"]:
+            seq_key = str(st["seq"])
+            st_hash = digest(st)
+            stop_hashes[seq_key] = st_hash
+
+            if new_inst or prev_stop_hashes.get(seq_key) != st_hash:
                 stop_rows.append({
                     "snapshot_ts_kyiv": ts,
                     "instance_id": instance_id,
                     "trip_key": key,
-                    "seq": s["seq"],
-                    "station": s["station"],
-                    "dev_min": s["dev_min"],
-                    "forecast": s["forecast"],
-                    "scheduled": s["scheduled"],
-                    "passed": int(s["passed"]),
-                    "is_watched": int(matches_watch(norm(s["station"]))),
+                    "seq": st["seq"],
+                    "station": st["station"],
+                    "dev_min": st["dev_min"],
+                    "forecast": st["forecast"],
+                    "scheduled": st["scheduled"],
+                    "passed": int(st["passed"]),
+                    "is_watched": int(matches_watch(norm(st["station"]))),
                 })
 
-        # ---- зведена таблиця станцій: по одному рядку на станцію рейсу,
-        #      перезаписується актуальними значеннями
-        for st in r["stops"]:
-            stops_latest[(instance_id, str(st["seq"]))] = {
-                "instance_id": instance_id,
-                "trip_key": key,
-                "train_number": r["train_number"],
-                "station_from": r["station_from"],
-                "station_to": r["station_to"],
-                "seq": st["seq"],
-                "station": st["station"],
-                "dev_min": st["dev_min"],
-                "forecast": st["forecast"],
-                "scheduled": st["scheduled"],
-                "passed": int(st["passed"]),
-                "is_watched": int(matches_watch(norm(st["station"]))),
-                "updated_ts_kyiv": ts,
-            }
+            # ---- зведена таблиця станцій: останнє ВІДОМЕ значення
+            latest_key = (instance_id, seq_key)
+            stops_latest[latest_key] = merge_stop(
+                stops_latest.get(latest_key), st, instance_id, key, r, ts
+            )
 
         # ---- зведена таблиця: рядок на ПРИМІРНИК рейсу
         delay = r["delay_min"]
@@ -595,9 +647,10 @@ def main():
             "instance_id": instance_id,
             "last_seen_epoch": now_epoch,
             "main": main_fingerprint,
-            "stops": stops_fingerprint,
+            "stop_hashes": stop_hashes,
             "delay_min": delay,
             "passed_count": r["passed_count"],
+            "n_stops": r["n_stops"],
         }
 
     # прибираємо з пам'яті рейси, яких давно немає в табло
@@ -620,6 +673,7 @@ def main():
 
     run["snapshots_added"] = append_rows(SNAPSHOTS_CSV, SNAP_FIELDS, snap_rows)
     run["stops_added"] = append_rows(STOPS_CSV, STOP_FIELDS, stop_rows)
+    run["stops_latest_rows"] = len(stops_latest)
     write_trips(trips)
     write_stops_latest(stops_latest)
     save_state(state)
