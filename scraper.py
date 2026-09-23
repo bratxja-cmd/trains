@@ -4,7 +4,7 @@
 Збір даних про затримки потягів з табло «Що з моїм поїздом?» АТ «Укрзалізниця».
 Джерело: https://uz-vezemo.uz.gov.ua/delayform
 
-Версія 4. Зміни проти першої:
+Версія 5. Зміни проти першої:
   * РЕЙСИ-ПРИМІРНИКИ (instance_id). Той самий номер потяга на тому самому
     маршруті їздить щодня, а дата відправлення на сайті показується не
     завжди. Тому новий примірник визначається не датою, а трьома ознаками:
@@ -27,6 +27,10 @@
     значення зберігається, а колонка kept_last_known це позначає.
   * У stops.csv пишуться лише станції, які справді змінились, а не весь
     маршрут щоразу. Обсяг файлу падає приблизно на порядок.
+  * СПОСТЕРЕЖЕНА ВІДСУТНІСТЬ. Рейс вважається зниклим не тому, що минув
+    час, а тому, що відбувся запуск і рейсу в табло не було. Планувальник
+    GitHub пропускає запуски, і раніше власна пауза скрипта видавалась за
+    завершення рейсу: один потяг дробився на три.
 """
 
 import csv
@@ -75,6 +79,7 @@ GAP_HOURS = 4          # зник із табло довше, ніж на сті
 DELAY_DROP_MIN = 90    # затримка впала більше ніж на стільки хвилин -> новий рейс
 ROUTE_RESET_MIN = 3    # на стільки станцій має «відкотитись» маршрут -> новий рейс
 RETENTION_HOURS = 60   # скільки тримати в пам'яті рейси, яких зараз немає в табло
+MISSED_RUNS_TO_FINISH = 2   # у стількох запусках поспіль рейсу немає -> завершений
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SNAPSHOTS_CSV = os.path.join(DATA_DIR, "snapshots.csv")
@@ -260,19 +265,29 @@ def parse_page(html):
 
 
 def is_new_instance(prev, row, now_epoch):
-    """Чи це новий рейс, а не продовження вже відомого? -> (bool, причина)."""
-    if prev is None:
-        return True, "first_seen"
+    """
+    Чи це новий рейс, а не продовження вже відомого? -> (bool, причина, прапорець).
 
-    gap_h = (now_epoch - float(prev.get("last_seen_epoch") or 0)) / 3600.0
-    if gap_h >= GAP_HOURS:
-        return True, f"gap_{gap_h:.1f}h"
+    Ключове правило: розрив зараховується ТІЛЬКИ як спостережена відсутність.
+    Якщо на попередньому запуску рейс був у табло, то скільки б годин не
+    минуло між запусками — це той самий рейс, ми просто не дивилися.
+    """
+    if prev is None:
+        return True, "first_seen", 0
+
+    missed = as_int(prev.get("missed_runs"), 0) or 0
+    absent_since = float(prev.get("absent_since") or 0)
+
+    if missed > 0 and absent_since:
+        absent_h = (now_epoch - absent_since) / 3600.0
+        if absent_h >= GAP_HOURS:
+            return True, f"absent_{absent_h:.1f}h_over_{missed}_runs", 0
 
     prev_delay = prev.get("delay_min")
     cur_delay = row["delay_min"]
     if prev_delay is not None and cur_delay is not None:
         if prev_delay - cur_delay >= DELAY_DROP_MIN:
-            return True, f"delay_drop_{prev_delay - cur_delay}"
+            return True, f"delay_drop_{prev_delay - cur_delay}", 0
 
     # Маршрут «відкотився» на початок.
     # Порівнюємо ТІЛЬКИ якщо довжина маршруту не змінилась: УЗ час від часу
@@ -286,9 +301,12 @@ def is_new_instance(prev, row, now_epoch):
         and row["n_stops"] == prev_stops
         and (prev_passed - row["passed_count"]) >= ROUTE_RESET_MIN
     ):
-        return True, f"route_reset_{prev_passed}->{row['passed_count']}"
+        return True, f"route_reset_{prev_passed}->{row['passed_count']}", 0
 
-    return False, ""
+    # Рейс продовжується. Якщо між запусками була довга пауза — позначаємо,
+    # що ідентичність спирається на пропущений період.
+    run_gap_h = (now_epoch - float(prev.get("last_seen_epoch") or 0)) / 3600.0
+    return False, "", 1 if run_gap_h >= GAP_HOURS else 0
 
 
 def is_blank(value):
@@ -355,6 +373,7 @@ TRIP_FIELDS = [
     "min_delay_min", "last_status", "last_reliability", "last_reason",
     "n_stops", "passed_count", "last_stop_passed", "finished",
     "finished_at_kyiv", "final_delay_min", "instance_reason",
+    "after_monitoring_gap",
 ]
 
 LATEST_STOP_FIELDS = [
@@ -366,7 +385,7 @@ LATEST_STOP_FIELDS = [
 RUN_FIELDS = [
     "run_ts_kyiv", "run_ts_utc", "ok", "error", "tz_ok", "page_updated",
     "rows_total", "rows_kept", "new_instances", "snapshots_added", "stops_added",
-    "stops_latest_rows", "finished_now",
+    "stops_latest_rows", "finished_now", "gap_since_prev_run_min",
 ]
 
 
@@ -452,10 +471,11 @@ def load_state():
             with open(STATE_JSON, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and "trips" in data:
+                data.setdefault("last_run_epoch", 0)
                 return data
         except Exception:
             pass
-    return {"trips": {}}
+    return {"trips": {}, "last_run_epoch": 0}
 
 
 def save_state(state):
@@ -479,7 +499,7 @@ def main():
         "run_ts_kyiv": ts, "run_ts_utc": ts_utc, "ok": 0, "error": "",
         "tz_ok": int(TZ_OK), "page_updated": "", "rows_total": 0, "rows_kept": 0,
         "new_instances": 0, "snapshots_added": 0, "stops_added": 0,
-        "stops_latest_rows": 0, "finished_now": 0,
+        "stops_latest_rows": 0, "finished_now": 0, "gap_since_prev_run_min": "",
     }
 
     try:
@@ -506,6 +526,10 @@ def main():
     base_counts = Counter(r["trip_key"] for r in kept)
 
     state = load_state()
+    prev_run_epoch = float(state.get("last_run_epoch") or 0)
+    if prev_run_epoch:
+        run["gap_since_prev_run_min"] = round((now_epoch - prev_run_epoch) / 60)
+
     trips = read_trips()
     stops_latest = read_stops_latest()
     snap_rows, stop_rows = [], []
@@ -531,7 +555,7 @@ def main():
         seen_now.add(key)
 
         prev = state["trips"].get(key)
-        new_inst, reason = is_new_instance(prev, r, now_epoch)
+        new_inst, reason, after_gap = is_new_instance(prev, r, now_epoch)
 
         if new_inst:
             instance_id = make_instance_id(key, now)
@@ -616,6 +640,7 @@ def main():
                 "finished_at_kyiv": "",
                 "final_delay_min": "",
                 "instance_reason": reason,
+                "after_monitoring_gap": after_gap,
             }
         else:
             prev_max = as_int(trip.get("max_delay_min"))
@@ -641,6 +666,9 @@ def main():
                 "finished": 0,
                 "finished_at_kyiv": "",
                 "final_delay_min": "",
+                "after_monitoring_gap": max(
+                    as_int(trip.get("after_monitoring_gap"), 0) or 0, after_gap
+                ),
             })
 
         state["trips"][key] = {
@@ -651,6 +679,8 @@ def main():
             "delay_min": delay,
             "passed_count": r["passed_count"],
             "n_stops": r["n_stops"],
+            "missed_runs": 0,
+            "absent_since": 0,
         }
 
     # прибираємо з пам'яті рейси, яких давно немає в табло
@@ -660,19 +690,53 @@ def main():
         if float(v.get("last_seen_epoch") or 0) >= cutoff
     }
 
-    # ---- рейси, яких більше немає в табло, позначаємо завершеними
+    # ---- рейси, яких НЕ БУЛО в цьому запуску: рахуємо спостережену відсутність
+    for trip_key_state, st in state["trips"].items():
+        if trip_key_state in seen_now:
+            continue
+        st["missed_runs"] = (as_int(st.get("missed_runs"), 0) or 0) + 1
+        if not st.get("absent_since"):
+            st["absent_since"] = now_epoch
+
+    # ---- завершеними позначаємо лише після MISSED_RUNS_TO_FINISH запусків
+    # поспіль без рейсу. Час завершення — момент ПЕРШОЇ відсутності, а не
+    # поточний: так він не зміщується на тривалість паузи в моніторингу.
+    absent_by_instance = {}
+    for st in state["trips"].values():
+        inst = st.get("instance_id")
+        if inst:
+            absent_by_instance[inst] = st
+
     for inst_id, trip in trips.items():
         if inst_id in seen_instances:
             continue
         if as_int(trip.get("finished"), 0):
             continue
+
+        st = absent_by_instance.get(inst_id)
+        if st is None:
+            # рейс випав із пам'яті (давній) — завершуємо як є
+            missed = MISSED_RUNS_TO_FINISH
+            absent_ts = ts
+        else:
+            missed = as_int(st.get("missed_runs"), 0) or 0
+            absent_epoch = float(st.get("absent_since") or 0)
+            absent_ts = (
+                datetime.fromtimestamp(absent_epoch, KYIV).strftime("%Y-%m-%d %H:%M:%S")
+                if absent_epoch else ts
+            )
+
+        if missed < MISSED_RUNS_TO_FINISH:
+            continue
+
         trip["finished"] = 1
-        trip["finished_at_kyiv"] = ts
+        trip["finished_at_kyiv"] = absent_ts
         trip["final_delay_min"] = trip.get("last_delay_min", "")
         run["finished_now"] += 1
 
     run["snapshots_added"] = append_rows(SNAPSHOTS_CSV, SNAP_FIELDS, snap_rows)
     run["stops_added"] = append_rows(STOPS_CSV, STOP_FIELDS, stop_rows)
+    state["last_run_epoch"] = now_epoch
     run["stops_latest_rows"] = len(stops_latest)
     write_trips(trips)
     write_stops_latest(stops_latest)
