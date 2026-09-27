@@ -1,3 +1,4 @@
 ﻿run_ts_kyiv,run_ts_utc,ok,error,tz_ok,page_updated,rows_total,rows_kept,new_instances,snapshots_added,stops_added,stops_latest_rows,finished_now,gap_since_prev_run_min
 2026-09-27 20:17:37,2026-09-27 17:17:37,1,,1,27 вересня 19:46,31,31,31,31,425,425,0,
 2026-09-27 23:11:06,2026-09-27 20:11:06,1,,1,27 вересня 23:04,53,53,24,53,572,738,0,173
+2026-09-28 02:01:52,2026-09-27 23:01:52,1,,1,28 вересня 02:01,68,68,28,68,786,1120,1,171
