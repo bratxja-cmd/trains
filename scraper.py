@@ -4,7 +4,7 @@
 Збір даних про затримки потягів з табло «Що з моїм поїздом?» АТ «Укрзалізниця».
 Джерело: https://uz-vezemo.uz.gov.ua/delayform
 
-Версія 5. Зміни проти першої:
+Версія 6. Зміни проти першої:
   * РЕЙСИ-ПРИМІРНИКИ (instance_id). Той самий номер потяга на тому самому
     маршруті їздить щодня, а дата відправлення на сайті показується не
     завжди. Тому новий примірник визначається не датою, а трьома ознаками:
@@ -22,15 +22,19 @@
   * Ознака route_reset спрацьовує лише за незмінної довжини маршруту і при
     відкаті щонайменше на ROUTE_RESET_MIN станцій: УЗ додає та прибирає
     станції в переліку, і без цієї умови рейс помилково дробився надвоє.
-  * stops_latest більше не затирає відоме значення порожнім. УЗ прибирає
-    фактичні дані по станції після її проходження; тепер останнє відоме
-    значення зберігається, а колонка kept_last_known це позначає.
+  * stops_latest не затирає відоме значення порожнім (у версії 6 це
+    правило розділено на факт і прогноз окремо, див. нижче).
   * У stops.csv пишуться лише станції, які справді змінились, а не весь
     маршрут щоразу. Обсяг файлу падає приблизно на порядок.
   * СПОСТЕРЕЖЕНА ВІДСУТНІСТЬ. Рейс вважається зниклим не тому, що минув
     час, а тому, що відбувся запуск і рейсу в табло не було. Планувальник
     GitHub пропускає запуски, і раніше власна пауза скрипта видавалась за
     завершення рейсу: один потяг дробився на три.
+  * ФАКТ ОКРЕМО ВІД ПРОГНОЗУ. Для непройдених станцій УЗ показує не
+    прогноз у справжньому сенсі, а поточну затримку, скопійовану на всі
+    станції далі. У stops_latest факт (після проходження) і прогноз (до
+    проходження) тепер у різних колонках, з віком останнього прогнозу.
+    У trips додано final_delay_fact_min і max_dev_fact_min — лише факти.
 """
 
 import csv
@@ -313,26 +317,77 @@ def is_blank(value):
     return value is None or value == ""
 
 
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def minutes_between(ts_from, ts_to):
+    """Хвилини між двома мітками формату TS_FMT, або '' якщо однієї немає."""
+    if is_blank(ts_from) or is_blank(ts_to):
+        return ""
+    try:
+        a = datetime.strptime(ts_from, TS_FMT)
+        b = datetime.strptime(ts_to, TS_FMT)
+    except ValueError:
+        return ""
+    return round((b - a).total_seconds() / 60)
+
+
 def merge_stop(old_row, stop, instance_id, trip_key, row, ts):
     """
-    Зведений рядок станції. УЗ прибирає фактичні дані після проходження
-    станції, тому порожнє нове значення НЕ затирає вже відоме старе.
-    """
-    old_row = old_row or {}
-    kept = 0
-    merged = {}
-    for field, value in (
-        ("dev_min", stop["dev_min"]),
-        ("forecast", stop["forecast"]),
-        ("scheduled", stop["scheduled"]),
-    ):
-        if is_blank(value) and not is_blank(old_row.get(field)):
-            merged[field] = old_row[field]
-            kept = 1
-        else:
-            merged[field] = value
+    Зведений рядок станції. ФАКТ і ПРОГНОЗ зберігаються окремо і ніколи
+    не змішуються.
 
-    merged.update({
+    Як УЗ показує станції:
+      * непройдена станція -> відхилення є ПРОГНОЗОМ: поточна затримка
+        механічно скопійована на всі станції далі за маршрутом;
+      * пройдена станція -> відхилення є ФАКТОМ, але УЗ часто прибирає
+        його (показує прочерк) невдовзі після проходження.
+
+    Тому:
+      * dev_forecast_min — останній прогноз, поки станцію ще не пройдено;
+      * dev_fact_min     — значення, побачене вже ПІСЛЯ проходження;
+      * forecast_age_min — скільки хвилин минуло між останнім прогнозом і
+        першим запуском, де станція вже пройдена (верхня межа «віку»
+        прогнозу: реальний момент проходження десь між цими запусками).
+    """
+    old = old_row or {}
+    dev = stop["dev_min"]
+    clock = stop["forecast"]
+    passed = bool(stop["passed"])
+
+    dev_forecast = old.get("dev_forecast_min", "")
+    forecast_time = old.get("forecast_time", "")
+    forecast_seen = old.get("forecast_seen_kyiv", "")
+    dev_fact = old.get("dev_fact_min", "")
+    fact_time = old.get("fact_time", "")
+    passed_seen = old.get("passed_seen_kyiv", "")
+
+    if not passed:
+        if not is_blank(dev):
+            dev_forecast = dev
+            forecast_time = clock
+            forecast_seen = ts
+    else:
+        if is_blank(passed_seen):
+            passed_seen = ts
+        if not is_blank(dev):
+            # УЗ може уточнити факт — беремо найсвіжіше непорожнє значення
+            dev_fact = dev
+            fact_time = clock
+        # порожнє значення факт НЕ затирає
+
+    if not is_blank(dev_fact):
+        value_type = "fact"
+    elif passed:
+        value_type = "passed_no_fact"   # пройдено, але УЗ факт не показала
+    else:
+        value_type = "forecast"
+
+    scheduled = stop["scheduled"]
+    if is_blank(scheduled):
+        scheduled = old.get("scheduled", "")
+
+    return {
         "instance_id": instance_id,
         "trip_key": trip_key,
         "train_number": row["train_number"],
@@ -340,12 +395,19 @@ def merge_stop(old_row, stop, instance_id, trip_key, row, ts):
         "station_to": row["station_to"],
         "seq": stop["seq"],
         "station": stop["station"],
-        "passed": int(stop["passed"]),          # прапорець завжди актуальний
+        "scheduled": scheduled,
+        "passed": int(passed),
+        "value_type": value_type,
+        "dev_fact_min": dev_fact,
+        "fact_time": fact_time,
+        "dev_forecast_min": dev_forecast,
+        "forecast_time": forecast_time,
+        "forecast_seen_kyiv": forecast_seen,
+        "passed_seen_kyiv": passed_seen,
+        "forecast_age_min": minutes_between(forecast_seen, passed_seen),
         "is_watched": int(matches_watch(norm(stop["station"]))),
-        "kept_last_known": kept,
         "updated_ts_kyiv": ts,
-    })
-    return merged
+    }
 
 
 def make_instance_id(trip_key, now):
@@ -372,14 +434,17 @@ TRIP_FIELDS = [
     "last_seen_kyiv", "n_seen", "last_delay_min", "max_delay_min",
     "min_delay_min", "last_status", "last_reliability", "last_reason",
     "n_stops", "passed_count", "last_stop_passed", "finished",
-    "finished_at_kyiv", "final_delay_min", "instance_reason",
-    "after_monitoring_gap",
+    "finished_at_kyiv", "final_delay_min", "final_delay_fact_min",
+    "max_dev_fact_min", "instance_reason", "after_monitoring_gap",
 ]
 
 LATEST_STOP_FIELDS = [
     "instance_id", "trip_key", "train_number", "station_from", "station_to",
-    "seq", "station", "dev_min", "forecast", "scheduled", "passed",
-    "is_watched", "kept_last_known", "updated_ts_kyiv",
+    "seq", "station", "scheduled", "passed", "value_type",
+    "dev_fact_min", "fact_time",
+    "dev_forecast_min", "forecast_time", "forecast_seen_kyiv",
+    "passed_seen_kyiv", "forecast_age_min",
+    "is_watched", "updated_ts_kyiv",
 ]
 
 RUN_FIELDS = [
@@ -612,6 +677,18 @@ def main():
                 stops_latest.get(latest_key), st, instance_id, key, r, ts
             )
 
+        # ---- ФАКТИ рівня рейсу (лише пройдені станції з непорожнім значенням)
+        fact_devs = [
+            st["dev_min"] for st in r["stops"]
+            if st["passed"] and st["dev_min"] is not None
+        ]
+        cur_max_fact = max(fact_devs) if fact_devs else None
+
+        # фактична затримка прибуття — лише коли кінцева вже пройдена
+        cur_final_fact = None
+        if r["stops"] and r["stops"][-1]["passed"] and r["stops"][-1]["dev_min"] is not None:
+            cur_final_fact = r["stops"][-1]["dev_min"]
+
         # ---- зведена таблиця: рядок на ПРИМІРНИК рейсу
         delay = r["delay_min"]
         trip = trips.get(instance_id)
@@ -639,6 +716,8 @@ def main():
                 "finished": 0,
                 "finished_at_kyiv": "",
                 "final_delay_min": "",
+                "final_delay_fact_min": "" if cur_final_fact is None else cur_final_fact,
+                "max_dev_fact_min": "" if cur_max_fact is None else cur_max_fact,
                 "instance_reason": reason,
                 "after_monitoring_gap": after_gap,
             }
@@ -670,6 +749,16 @@ def main():
                     as_int(trip.get("after_monitoring_gap"), 0) or 0, after_gap
                 ),
             })
+
+            prev_fact_max = as_int(trip.get("max_dev_fact_min"))
+            if cur_max_fact is not None:
+                trip["max_dev_fact_min"] = (
+                    cur_max_fact if prev_fact_max is None
+                    else max(prev_fact_max, cur_max_fact)
+                )
+            # факт прибуття: порожнє значення НЕ затирає вже зафіксований
+            if cur_final_fact is not None:
+                trip["final_delay_fact_min"] = cur_final_fact
 
         state["trips"][key] = {
             "instance_id": instance_id,
